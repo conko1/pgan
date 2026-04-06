@@ -13,28 +13,31 @@ import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
 
 
-# ============================================================
-# image helpers
-# ============================================================
+# Pomocné funkcie na načítanie, prevod rozsahu hodnôt a základné spracovanie obrázkov a masiek.
 
 def load_gray(path: str) -> torch.Tensor:
+    # Načíta obrázok v grayscale a prevedie ho na tensor v rozsahu <0, 1>.
     return TF.to_tensor(Image.open(path).convert("L"))
 
 
 def load_binary_mask(path: str, thr: float = 1.0 / 255.0) -> torch.Tensor:
+    # Načíta masku a binarizuje ju, aby mala len 0/1 hodnoty.
     m = TF.to_tensor(Image.open(path).convert("L"))
     return (m >= thr).float()
 
 
 def to_model_range(x: torch.Tensor) -> torch.Tensor:
+    # Prevedie dáta z rozsahu <0, 1> do rozsahu <-1, 1> pre model.
     return x * 2.0 - 1.0
 
 
 def to_image_range(x: torch.Tensor) -> torch.Tensor:
+    # Prevedie výstup modelu z rozsahu <-1, 1> späť do <0, 1>.
     return ((x + 1.0) * 0.5).clamp(0.0, 1.0)
 
 
 def save_image(x: torch.Tensor, path):
+    # Uloží tensor ako obrázok; ak je v modelovom rozsahu, najprv ho prevedie.
     x = x.detach().cpu()
     if x.min() < 0:
         x = to_image_range(x)
@@ -42,10 +45,13 @@ def save_image(x: torch.Tensor, path):
 
 
 def save_mask(mask: torch.Tensor, path):
+    # Uloží binárnu masku ako obrázok.
     TF.to_pil_image((mask.detach().cpu() > 0.5).float()).save(path)
 
 
 def ensure_min_size(*tensors: torch.Tensor, min_size: int):
+    # Zabezpečí, aby všetky vstupy mali aspoň minimálny rozmer.
+    # Masky sa škálujú nearest interpoláciou, obrázky bilineárne.
     h, w = tensors[0].shape[-2:]
     if h >= min_size and w >= min_size:
         return tensors
@@ -66,26 +72,23 @@ def ensure_min_size(*tensors: torch.Tensor, min_size: int):
 
 
 def pad_chw(x: torch.Tensor, pad: int, mode: str = "reflect", value: float = 0.0) -> torch.Tensor:
+    # Pridá padding okolo CHW tensoru; pre masky sa dá použiť aj konštantná hodnota.
     if mode == "constant":
         return F.pad(x, (pad, pad, pad, pad), mode=mode, value=value)
     return F.pad(x.unsqueeze(0), (pad, pad, pad, pad), mode=mode).squeeze(0)
 
 
 def center_crop_chw(x: torch.Tensor, h: int, w: int) -> torch.Tensor:
+    # Vyreže stredový crop požadovanej veľkosti.
     _, H, W = x.shape
     top = max(0, (H - h) // 2)
     left = max(0, (W - w) // 2)
     return x[:, top:top + h, left:left + w]
 
 
-def mask_bbox(mask: torch.Tensor):
-    ys, xs = torch.where(mask[0] > 0.5)
-    if len(xs) == 0:
-        return None
-    return xs.min().item(), ys.min().item(), xs.max().item(), ys.max().item()
-
-
 def lesion_crop(*tensors: torch.Tensor, mask: torch.Tensor, crop_size: int, jitter: int = 8):
+    # Vytvorí crop zameraný na léziu podľa masky.
+    # Ak maska neobsahuje nič, použije sa stredový crop.
     tensors = ensure_min_size(*tensors, mask, min_size=crop_size)
     *imgs, mask = tensors
     _, h, w = mask.shape
@@ -110,11 +113,11 @@ def lesion_crop(*tensors: torch.Tensor, mask: torch.Tensor, crop_size: int, jitt
     mask_crop = mask[:, y:y + crop_size, x:x + crop_size]
     return (*cropped, mask_crop)
 
-# ============================================================
-# augmentation
-# ============================================================
+# Spoločné augmentácie pre obrázky a masky, aby zostali navzájom zarovnané.
 
 def _shared_rotate_translate(*imgs: torch.Tensor, mask: torch.Tensor, angle_range: float = 12.0, max_shift: int = 8):
+    # Aplikuje rovnakú rotáciu a posun na obrázky aj masku.
+    # Pri maske sa používa nearest interpolácia, aby ostala binárna.
     angle = random.uniform(-angle_range, angle_range)
     pad = max(32, max_shift)
     h, w = imgs[0].shape[-2:]
@@ -140,6 +143,8 @@ def _shared_rotate_translate(*imgs: torch.Tensor, mask: torch.Tensor, angle_rang
 
 
 def _shared_intensity_noise(*imgs: torch.Tensor, p: float = 0.2, noise_p: float = 0.05, sigma: float = 0.003):
+    # Mení intenzitu, kontrast a občas pridáva jemný šum.
+    # Úpravy sa aplikujú rovnako na všetky vstupné obrázky.
     if random.random() < p:
         gamma = random.uniform(0.97, 1.03)
         gain = random.uniform(0.98, 1.03)
@@ -154,6 +159,8 @@ def _shared_intensity_noise(*imgs: torch.Tensor, p: float = 0.2, noise_p: float 
 
 
 def augment_sample(real: torch.Tensor, mask: torch.Tensor, corrupted: torch.Tensor | None = None):
+    # Zabalí augmentácie do jednej funkcie pre sample.
+    # Podporuje režim len s real+mask aj režim s real+corrupted+mask.
     items = [real] if corrupted is None else [real, corrupted]
 
     if random.random() < 0.5:
@@ -170,9 +177,7 @@ def augment_sample(real: torch.Tensor, mask: torch.Tensor, corrupted: torch.Tens
     return real, corrupted, mask
 
 
-# ============================================================
-# dataset
-# ============================================================
+# Dataset pripravuje cropy, masky a corrupted vstupy pre trénovanie inpainting modelu.
 
 class MammogramInpaintDataset(Dataset):
     def __init__(
@@ -183,6 +188,7 @@ class MammogramInpaintDataset(Dataset):
         crop_size=256,
         augment=True,
     ):
+        # Inicializácia ciest, parametrov datasetu a kontrola konzistencie súborov.
         self.healthy_dir = Path(healthy_dir)
         self.mask_dir = Path(mask_dir)
         self.corrupted_dir = Path(corrupted_dir) if corrupted_dir is not None else None
@@ -210,16 +216,17 @@ class MammogramInpaintDataset(Dataset):
             raise ValueError(f"Missing corrupted images, first few: {missing_corrupted[:5]}")
 
     def __len__(self):
+        # Vráti počet vzoriek v datasete.
         return len(self.healthy_paths)
 
     def __getitem__(self, idx):
+        # Načíta sample, pripraví crop okolo masky a vráti vstupy pre model.
         img_path = self.healthy_paths[idx]
         mask_path = self.mask_dir / f"{img_path.stem}_mask.png"
 
         real = load_gray(str(img_path))
         mask = load_binary_mask(str(mask_path))
         corrupted = load_gray(str(self.corrupted_dir / img_path.name)) if self.corrupted_dir is not None else None
-
 
         if corrupted is None:
             real, mask = ensure_min_size(real, mask, min_size=self.crop_size)
@@ -234,6 +241,8 @@ class MammogramInpaintDataset(Dataset):
 
         target_mask = mask.clone()
 
+        # Ak neexistuje corrupted vstup alebo je maska prázdna,
+        # synteticky sa "vymaže" oblasť masky z real obrázka.
         if corrupted is None or target_mask.sum().item() == 0:
             corrupted = real * (1.0 - target_mask)
 
@@ -245,12 +254,11 @@ class MammogramInpaintDataset(Dataset):
         }
 
 
-# ============================================================
-# model blocks
-# ============================================================
+# Základné stavebné bloky generátora a diskriminátora.
 
 class ConvNormAct(nn.Module):
     def __init__(self, in_ch, out_ch, k=3, s=1, p=1, act="relu"):
+        # Konvolučný blok: reflection padding + conv + instance norm + aktivácia.
         super().__init__()
         layers = [
             nn.ReflectionPad2d(p),
@@ -266,22 +274,26 @@ class ConvNormAct(nn.Module):
         self.block = nn.Sequential(*layers)
 
     def forward(self, x):
+        # Prechod vstupu cez celý blok.
         return self.block(x)
 
 
 class ResBlock(nn.Module):
     def __init__(self, ch, dropout=0.1):
+        # Reziduálny blok stabilizuje učenie a pomáha zachovať informáciu.
         super().__init__()
         self.c1 = ConvNormAct(ch, ch, act="relu")
         self.do = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.c2 = ConvNormAct(ch, ch, act="none")
 
     def forward(self, x):
+        # Skip connection: vstup sa pripočíta k transformovanému výstupu.
         return x + self.c2(self.do(self.c1(x)))
 
 
 class Down(nn.Module):
     def __init__(self, in_ch, out_ch):
+        # Downsampling blok znižuje rozlíšenie a zvyšuje počet kanálov.
         super().__init__()
         self.block = nn.Sequential(
             nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1, bias=False),
@@ -290,11 +302,13 @@ class Down(nn.Module):
         )
 
     def forward(self, x):
+        # Aplikuje downsampling blok.
         return self.block(x)
 
 
 class Up(nn.Module):
     def __init__(self, in_ch, out_ch, dropout=0.0):
+        # Upsampling blok obnovuje rozlíšenie v decoder časti siete.
         super().__init__()
         self.block = nn.Sequential(
             nn.ConvTranspose2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1, bias=False),
@@ -304,10 +318,12 @@ class Up(nn.Module):
         )
 
     def forward(self, x):
+        # Aplikuje upsampling blok.
         return self.block(x)
 
 
 def crop_to(ref_src, ref_dst):
+    # Zarovná feature mapu na veľkosť referenčnej mapy pomocou stredového orezu.
     _, _, h, w = ref_src.shape
     _, _, rh, rw = ref_dst.shape
     if h == rh and w == rw:
@@ -317,12 +333,12 @@ def crop_to(ref_src, ref_dst):
     return ref_src[:, :, top:top + rh, left:left + rw]
 
 
-# ============================================================
-# generator
-# ============================================================
+# U-Net generátor s reziduálnym bottleneckom pre inpainting.
 
 class ResidualUNetGenerator(nn.Module):
     def __init__(self, in_ch=2, out_ch=1, base=64, n_res=4):
+        # Encoder-decoder architektúra so skip connections.
+        # Vstupom je poškodený obrázok + maska.
         super().__init__()
         self.d1 = nn.Sequential(
             nn.Conv2d(in_ch, base, kernel_size=4, stride=2, padding=1),
@@ -341,6 +357,7 @@ class ResidualUNetGenerator(nn.Module):
         )
 
     def forward(self, corrupted, mask):
+        # Predikuje obsah chýbajúcej oblasti na základe vstupu a masky.
         x = torch.cat([corrupted, mask], dim=1)
         d1 = self.d1(x)
         d2 = self.d2(d1)
@@ -357,17 +374,18 @@ class ResidualUNetGenerator(nn.Module):
         return self.out(u3)
 
     def compose(self, corrupted, mask):
+        # Zloží finálny obrázok: mimo masky ostáva vstup,
+        # vo vnútri masky sa použije predikcia generátora.
         pred_hole = self.forward(corrupted, mask)
         fake = (corrupted * (1.0 - mask) + pred_hole * mask).clamp(-1.0, 1.0)
         return fake, pred_hole
 
 
-# ============================================================
-# discriminator
-# ============================================================
+# PatchGAN diskriminátor v dvoch mierkach.
 
 class SNBlock(nn.Module):
     def __init__(self, in_ch, out_ch, stride=2):
+        # Konvolučný blok so spectral normalization pre stabilnejší tréning GAN.
         super().__init__()
         self.block = nn.Sequential(
             spectral_norm(nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=stride, padding=1)),
@@ -375,11 +393,13 @@ class SNBlock(nn.Module):
         )
 
     def forward(self, x):
+        # Prechod vstupu cez diskriminačný blok.
         return self.block(x)
 
 
 class PatchDiscriminator(nn.Module):
     def __init__(self, in_ch=3, base=64):
+        # Hodnotí realizmus lokálnych patchov namiesto celého obrázka naraz.
         super().__init__()
         self.b1 = SNBlock(in_ch, base, stride=2)
         self.b2 = SNBlock(base, base * 2, stride=2)
@@ -388,6 +408,8 @@ class PatchDiscriminator(nn.Module):
         self.out = spectral_norm(nn.Conv2d(base * 8, 1, kernel_size=4, stride=1, padding=1))
 
     def forward(self, corrupted, img, mask, return_features=False):
+        # Diskriminátor dostáva corrupted vstup, výsledný obrázok a masku.
+        # Voliteľne vracia aj intermediate features pre feature matching loss.
         x = torch.cat([corrupted, img, mask], dim=1)
         f1 = self.b1(x)
         f2 = self.b2(f1)
@@ -401,12 +423,14 @@ class PatchDiscriminator(nn.Module):
 
 class MultiScaleDiscriminator(nn.Module):
     def __init__(self):
+        # Dva PatchGAN diskriminátory pracujú na rôznych mierkach.
         super().__init__()
         self.d1 = PatchDiscriminator()
         self.d2 = PatchDiscriminator()
         self.pool = nn.AvgPool2d(kernel_size=3, stride=2, padding=1, count_include_pad=False)
 
     def forward(self, corrupted, img, mask, return_features=False):
+        # Prvá vetva pracuje v pôvodnom rozlíšení, druhá v zmenšenom.
         if return_features:
             out1, feat1 = self.d1(corrupted, img, mask, return_features=True)
             corrupted2, img2, mask2 = self.pool(corrupted), self.pool(img), self.pool(mask)
@@ -419,16 +443,18 @@ class MultiScaleDiscriminator(nn.Module):
         return [out1, out2]
 
 
-# ============================================================
-# losses
-# ============================================================
+# Straty pre rekonštrukciu, adversarial učenie a stabilizáciu.
 
 def masked_l1(pred, target, mask, min_pixels=32.0):
+    # L1 chyba počítaná iba v oblasti definovanej maskou.
+    # min_pixels zabraňuje príliš veľkým hodnotám pri malých maskách.
     pixels = mask.sum(dim=(1, 2, 3)).clamp_min(min_pixels)
     return ((pred - target).abs() * mask).sum(dim=(1, 2, 3)).div(pixels).mean()
 
 
 def boundary_ring(mask, k=7):
+    # Vytvorí prstenec okolo hranice masky pomocou dilatácie a erózie.
+    # Používa sa na zvýraznenie kvality prechodu na okrajoch.
     pad = k // 2
     dil = F.max_pool2d(mask, kernel_size=k, stride=1, padding=pad)
     ero = -F.max_pool2d(-mask, kernel_size=k, stride=1, padding=pad)
@@ -436,13 +462,17 @@ def boundary_ring(mask, k=7):
 
 
 def d_hinge(real_logits, fake_logits):
+    # Hinge loss pre diskriminátor.
     return F.relu(1.0 - real_logits).mean() + F.relu(1.0 + fake_logits).mean()
 
 def g_hinge(fake_logits):
+    # Hinge loss pre generátor.
     return -fake_logits.mean()
 
 
 def feature_matching(fake_feats, real_feats):
+    # Porovnáva intermediate feature mapy reálnych a generovaných obrázkov.
+    # Pomáha generátoru produkovať stabilnejšie a realistickejšie detaily.
     total, n = 0.0, 0
     for ff_scale, rf_scale in zip(fake_feats, real_feats):
         for ff, rf in zip(ff_scale, rf_scale):
@@ -452,17 +482,19 @@ def feature_matching(fake_feats, real_feats):
 
 
 def r1_penalty(discriminator_single_scale, corrupted, real, mask):
+    # R1 regularizácia penalizuje príliš ostré gradienty diskriminátora
+    # vzhľadom na reálny vstup.
     real = real.requires_grad_(True)
     pred = discriminator_single_scale(corrupted, real, mask)
     grad = torch.autograd.grad(pred.sum(), real, create_graph=True, retain_graph=True, only_inputs=True)[0]
     return grad.pow(2).reshape(grad.size(0), -1).sum(1).mean()
 
 
-# ============================================================
-# train / infer
-# ============================================================
+# Funkcie na vytvorenie DataLoadera, tréning modelu
+# a generovanie výstupov.
 
 def build_loader(healthy_dir, mask_dir, corrupted_dir=None, crop_size=256, batch_size=8, num_workers=0, augment=True):
+    # Vytvorí dataset a DataLoader pre tréning alebo inferenciu.
     ds = MammogramInpaintDataset(
         healthy_dir=healthy_dir,
         mask_dir=mask_dir,
@@ -499,6 +531,8 @@ def train(
     r1_gamma=5.0,
     r1_every=8,
 ):
+    # Hlavná tréningová slučka pre GAN inpainting model.
+    # Striedavo sa učí diskriminátor a generátor.
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     dl = build_loader(healthy_dir, mask_dir, corrupted_dir, crop_size, batch_size, num_workers, augment=True)
 
@@ -523,6 +557,7 @@ def train(
             real = batch["real_crop"].to(device)
 
             # ---- D ----
+            # Diskriminátor sa učí rozlišovať real a fake obrázky.
             with torch.amp.autocast("cuda", enabled=amp_enabled):
                 fake, _ = G.compose(corrupted, mask)
                 pred_real = D(corrupted, real, mask)
@@ -536,6 +571,7 @@ def train(
 
             loss_r1 = torch.tensor(0.0, device=device)
             if step_global % r1_every == 0:
+                # Periodická R1 regularizácia pre stabilizáciu diskriminátora.
                 opt_d.zero_grad(set_to_none=True)
                 with torch.amp.autocast("cuda", enabled=False):
                     loss_r1 = 0.5 * r1_gamma * r1_penalty(D.d1, corrupted.float(), real.float(), mask.float())
@@ -543,6 +579,7 @@ def train(
                 opt_d.step()
 
             # ---- G ----
+            # Generátor sa učí vyplniť maskovanú oblasť realisticky a konzistentne.
             with torch.amp.autocast("cuda", enabled=amp_enabled):
                 fake, _ = G.compose(corrupted, mask)
                 pred_fake, fake_feats = D(corrupted, fake, mask, return_features=True)
@@ -556,6 +593,7 @@ def train(
                 loss_boundary = masked_l1(fake, real, boundary, min_pixels=32.0)
                 loss_fm = feature_matching(fake_feats, real_feats)
 
+                # Finálna strata kombinuje GAN loss a viacero rekonštrukčných zložiek.
                 loss_g = (
                     loss_adv
                     + lambda_hole * loss_hole
@@ -570,6 +608,7 @@ def train(
             scaler_g.update()
 
             if step % 20 == 0:
+                # Priebežný výpis metrík počas tréningu.
                 print(
                     f"epoch {epoch + 1}/{epochs} step {step:04d} | "
                     f"D={loss_d.item():.4f} R1={loss_r1.item():.4f} G={loss_g.item():.4f} "
@@ -579,6 +618,7 @@ def train(
 
             step_global += 1
 
+    # Po tréningu sa uloží naučený generátor.
     torch.save(G.state_dict(), save_path)
     print(f"Saved generator to {save_path}")
     return G, D
@@ -593,6 +633,7 @@ def generate(
     crop_size=256,
     device=None,
 ):
+    # Načíta natrénovaný generátor a vytvorí výstupné obrázky pre všetky vstupy.
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -607,6 +648,7 @@ def generate(
 
     with torch.no_grad():
         for img_path in healthy_paths:
+            # Pripraví vstupný crop a masku pre generovanie.
             real = load_gray(str(img_path))
             mask = load_binary_mask(str(Path(mask_dir) / f"{img_path.stem}_mask.png"))
 
@@ -621,12 +663,13 @@ def generate(
             corrupted_batch = to_model_range(corrupted).unsqueeze(0).to(device)
             mask_batch = mask.unsqueeze(0).to(device)
 
-            # outside from input image, inside from prediction
+            # Mimo masky ostáva vstup, vnútro masky doplní model.
             fake_batch, pred_hole_batch = G.compose(corrupted_batch, mask_batch)
 
             fake = to_image_range(fake_batch[0].cpu())
             real_vis = real.cpu()
 
+            # Uloží real crop, masku a vygenerovaný výsledok.
             base = img_path.stem
             save_image(real_vis, out_dir / f"{base}_real_crop.png")
             save_mask(mask, out_dir / f"{base}_target_mask.png")
@@ -634,7 +677,7 @@ def generate(
 
 
 if __name__ == "__main__":
-    # Example:
+    # Príklad tréningu modelu.
     # train(
     #     healthy_dir="images_vindr",
     #     mask_dir="masks_vindr",
@@ -645,6 +688,7 @@ if __name__ == "__main__":
     #     save_path="generator_classic-inpainted_bigger_3_out16.pt",
     # )
 
+    # Príklad generovania syntetických výstupov z natrénovaného modelu.
     generate(
         healthy_dir="images_vindr_removed",
         mask_dir="images_vindr_removed_masks",
