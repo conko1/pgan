@@ -8,7 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import spectral_norm
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms.functional as TF
 from torchvision.transforms import InterpolationMode
 
@@ -20,10 +20,9 @@ def load_gray(path: str) -> torch.Tensor:
     return TF.to_tensor(Image.open(path).convert("L"))
 
 
-def load_binary_mask(path: str, thr: float = 1.0 / 255.0) -> torch.Tensor:
+def load_binary_mask(path: str) -> torch.Tensor:
     # Načíta masku a binarizuje ju, aby mala len 0/1 hodnoty.
-    m = TF.to_tensor(Image.open(path).convert("L"))
-    return (m >= thr).float()
+    return (TF.to_tensor(Image.open(path).convert("L")) >= 1.0 / 255.0).float()
 
 
 def to_model_range(x: torch.Tensor) -> torch.Tensor:
@@ -64,10 +63,8 @@ def ensure_min_size(*tensors: torch.Tensor, min_size: int):
     for t in tensors:
         is_mask = bool(torch.all((t == 0) | (t == 1)))
         interp = InterpolationMode.NEAREST if is_mask else InterpolationMode.BILINEAR
-        resized = TF.resize(t, [nh, nw], interpolation=interp, antialias=not is_mask)
-        if is_mask:
-            resized = (resized > 0.5).float()
-        out.append(resized)
+        t = TF.resize(t, [nh, nw], interpolation=interp, antialias=not is_mask)
+        out.append((t > 0.5).float() if is_mask else t)
     return tuple(out)
 
 
@@ -86,7 +83,7 @@ def center_crop_chw(x: torch.Tensor, h: int, w: int) -> torch.Tensor:
     return x[:, top:top + h, left:left + w]
 
 
-def lesion_crop(*tensors: torch.Tensor, mask: torch.Tensor, crop_size: int, jitter: int = 8):
+def lesion_crop(*tensors: torch.Tensor, mask: torch.Tensor, crop_size: int):
     # Vytvorí crop zameraný na léziu podľa masky.
     # Ak maska neobsahuje nič, použije sa stredový crop.
     tensors = ensure_min_size(*tensors, mask, min_size=crop_size)
@@ -102,35 +99,33 @@ def lesion_crop(*tensors: torch.Tensor, mask: torch.Tensor, crop_size: int, jitt
         i = random.randint(0, len(xs) - 1)
         cx = xs[i].item()
         cy = ys[i].item()
-
-        x = cx - crop_size // 2 + random.randint(-jitter, jitter)
-        y = cy - crop_size // 2 + random.randint(-jitter, jitter)
-
+        x = cx - crop_size // 2 + random.randint(-8, 8)
+        y = cy - crop_size // 2 + random.randint(-8, 8)
         x = max(0, min(x, w - crop_size))
         y = max(0, min(y, h - crop_size))
 
     cropped = [img[:, y:y + crop_size, x:x + crop_size] for img in imgs]
-    mask_crop = mask[:, y:y + crop_size, x:x + crop_size]
-    return (*cropped, mask_crop)
+    return (*cropped, mask[:, y:y + crop_size, x:x + crop_size])
 
 # Spoločné augmentácie pre obrázky a masky, aby zostali navzájom zarovnané.
 
-def _shared_rotate_translate(*imgs: torch.Tensor, mask: torch.Tensor, angle_range: float = 12.0, max_shift: int = 8):
+def _shared_rotate_translate(*imgs: torch.Tensor, mask: torch.Tensor):
     # Aplikuje rovnakú rotáciu a posun na obrázky aj masku.
     # Pri maske sa používa nearest interpolácia, aby ostala binárna.
-    angle = random.uniform(-angle_range, angle_range)
-    pad = max(32, max_shift)
+    angle = random.uniform(-12.0, 12.0)
+    max_shift = 8
+    pad = 32
     h, w = imgs[0].shape[-2:]
 
     out_imgs = []
     for img in imgs:
-        p = pad_chw(img, pad, mode="reflect")
-        r = TF.rotate(p, angle, interpolation=InterpolationMode.BILINEAR)
-        out_imgs.append(center_crop_chw(r, h + 2 * max_shift, w + 2 * max_shift))
+        img = pad_chw(img, pad, mode="reflect")
+        img = TF.rotate(img, angle, interpolation=InterpolationMode.BILINEAR)
+        out_imgs.append(center_crop_chw(img, h + 2 * max_shift, w + 2 * max_shift))
 
-    mask_p = pad_chw(mask, pad, mode="constant", value=0.0)
-    mask_r = TF.rotate(mask_p, angle, interpolation=InterpolationMode.NEAREST, fill=0.0)
-    mask_r = center_crop_chw(mask_r, h + 2 * max_shift, w + 2 * max_shift)
+    mask = pad_chw(mask, pad, mode="constant", value=0.0)
+    mask = TF.rotate(mask, angle, interpolation=InterpolationMode.NEAREST, fill=0.0)
+    mask = center_crop_chw(mask, h + 2 * max_shift, w + 2 * max_shift)
 
     tx = random.randint(-max_shift, max_shift)
     ty = random.randint(-max_shift, max_shift)
@@ -138,22 +133,22 @@ def _shared_rotate_translate(*imgs: torch.Tensor, mask: torch.Tensor, angle_rang
     top = max_shift - ty
 
     out_imgs = [img[:, top:top + h, left:left + w] for img in out_imgs]
-    mask_r = mask_r[:, top:top + h, left:left + w]
-    return (*out_imgs, (mask_r > 0).float())
+    mask = mask[:, top:top + h, left:left + w]
+    return (*out_imgs, (mask > 0).float())
 
 
-def _shared_intensity_noise(*imgs: torch.Tensor, p: float = 0.2, noise_p: float = 0.05, sigma: float = 0.003):
+def _shared_intensity_noise(*imgs: torch.Tensor):
     # Mení intenzitu, kontrast a občas pridáva jemný šum.
     # Úpravy sa aplikujú rovnako na všetky vstupné obrázky.
-    if random.random() < p:
+    if random.random() < 0.2:
         gamma = random.uniform(0.97, 1.03)
         gain = random.uniform(0.98, 1.03)
         imgs = tuple(TF.adjust_gamma(img, gamma=gamma, gain=gain) for img in imgs)
-    if random.random() < p:
+    if random.random() < 0.2:
         contrast = random.uniform(0.95, 1.08)
         imgs = tuple(TF.adjust_contrast(img, contrast) for img in imgs)
-    if random.random() < noise_p:
-        noise = torch.randn_like(imgs[0]) * sigma
+    if random.random() < 0.05:
+        noise = torch.randn_like(imgs[0]) * 0.003
         imgs = tuple((img + noise).clamp(0, 1) for img in imgs)
     return imgs
 
@@ -180,14 +175,7 @@ def augment_sample(real: torch.Tensor, mask: torch.Tensor, corrupted: torch.Tens
 # Dataset pripravuje cropy, masky a corrupted vstupy pre trénovanie inpainting modelu.
 
 class MammogramInpaintDataset(Dataset):
-    def __init__(
-        self,
-        healthy_dir,
-        mask_dir,
-        corrupted_dir=None,
-        crop_size=256,
-        augment=True,
-    ):
+    def __init__(self, healthy_dir, mask_dir, corrupted_dir=None, crop_size=256, augment=True):
         # Inicializácia ciest, parametrov datasetu a kontrola konzistencie súborov.
         self.healthy_dir = Path(healthy_dir)
         self.mask_dir = Path(mask_dir)
@@ -257,18 +245,16 @@ class MammogramInpaintDataset(Dataset):
 # Základné stavebné bloky generátora a diskriminátora.
 
 class ConvNormAct(nn.Module):
-    def __init__(self, in_ch, out_ch, k=3, s=1, p=1, act="relu"):
+    def __init__(self, in_ch, out_ch, act="relu"):
         # Konvolučný blok: reflection padding + conv + instance norm + aktivácia.
         super().__init__()
         layers = [
-            nn.ReflectionPad2d(p),
-            nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=0, bias=False),
+            nn.ReflectionPad2d(1),
+            nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=1, padding=0, bias=False),
             nn.InstanceNorm2d(out_ch, affine=True),
         ]
         if act == "relu":
             layers.append(nn.ReLU(inplace=True))
-        elif act == "lrelu":
-            layers.append(nn.LeakyReLU(0.2, inplace=True))
         elif act != "none":
             raise ValueError(act)
         self.block = nn.Sequential(*layers)
@@ -322,15 +308,15 @@ class Up(nn.Module):
         return self.block(x)
 
 
-def crop_to(ref_src, ref_dst):
+def crop_to(src, ref):
     # Zarovná feature mapu na veľkosť referenčnej mapy pomocou stredového orezu.
-    _, _, h, w = ref_src.shape
-    _, _, rh, rw = ref_dst.shape
+    _, _, h, w = src.shape
+    _, _, rh, rw = ref.shape
     if h == rh and w == rw:
-        return ref_src
+        return src
     top = max((h - rh) // 2, 0)
     left = max((w - rw) // 2, 0)
-    return ref_src[:, :, top:top + rh, left:left + rw]
+    return src[:, :, top:top + rh, left:left + rw]
 
 
 # U-Net generátor s reziduálnym bottleneckom pre inpainting.
@@ -365,12 +351,9 @@ class ResidualUNetGenerator(nn.Module):
         d4 = self.d4(d3)
         b = self.mid(d4)
 
-        u1 = crop_to(self.u1(b), d3)
-        u1 = torch.cat([u1, d3], dim=1)
-        u2 = crop_to(self.u2(u1), d2)
-        u2 = torch.cat([u2, d2], dim=1)
-        u3 = crop_to(self.u3(u2), d1)
-        u3 = torch.cat([u3, d1], dim=1)
+        u1 = torch.cat([crop_to(self.u1(b), d3), d3], dim=1)
+        u2 = torch.cat([crop_to(self.u2(u1), d2), d2], dim=1)
+        u3 = torch.cat([crop_to(self.u3(u2), d1), d1], dim=1)
         return self.out(u3)
 
     def compose(self, corrupted, mask):
@@ -431,14 +414,14 @@ class MultiScaleDiscriminator(nn.Module):
 
     def forward(self, corrupted, img, mask, return_features=False):
         # Prvá vetva pracuje v pôvodnom rozlíšení, druhá v zmenšenom.
+        corrupted2, img2, mask2 = self.pool(corrupted), self.pool(img), self.pool(mask)
+
         if return_features:
             out1, feat1 = self.d1(corrupted, img, mask, return_features=True)
-            corrupted2, img2, mask2 = self.pool(corrupted), self.pool(img), self.pool(mask)
             out2, feat2 = self.d2(corrupted2, img2, mask2, return_features=True)
             return [out1, out2], [feat1, feat2]
 
         out1 = self.d1(corrupted, img, mask)
-        corrupted2, img2, mask2 = self.pool(corrupted), self.pool(img), self.pool(mask)
         out2 = self.d2(corrupted2, img2, mask2)
         return [out1, out2]
 
@@ -465,6 +448,7 @@ def d_hinge(real_logits, fake_logits):
     # Hinge loss pre diskriminátor.
     return F.relu(1.0 - real_logits).mean() + F.relu(1.0 + fake_logits).mean()
 
+
 def g_hinge(fake_logits):
     # Hinge loss pre generátor.
     return -fake_logits.mean()
@@ -476,7 +460,7 @@ def feature_matching(fake_feats, real_feats):
     total, n = 0.0, 0
     for ff_scale, rf_scale in zip(fake_feats, real_feats):
         for ff, rf in zip(ff_scale, rf_scale):
-            total = total + F.l1_loss(ff, rf.detach())
+            total += F.l1_loss(ff, rf.detach())
             n += 1
     return total / max(1, n)
 
@@ -493,14 +477,22 @@ def r1_penalty(discriminator_single_scale, corrupted, real, mask):
 # Funkcie na vytvorenie DataLoadera, tréning modelu
 # a generovanie výstupov.
 
-def build_loader(healthy_dir, mask_dir, corrupted_dir=None, crop_size=256, batch_size=8, num_workers=0, augment=True):
+def build_loader(
+    healthy_dir,
+    mask_dir,
+    corrupted_dir=None,
+    crop_size=256,
+    batch_size=8,
+    num_workers=0,
+    augment=True,
+):
     # Vytvorí dataset a DataLoader pre tréning alebo inferenciu.
     ds = MammogramInpaintDataset(
         healthy_dir=healthy_dir,
         mask_dir=mask_dir,
         corrupted_dir=corrupted_dir,
         crop_size=crop_size,
-        augment=augment
+        augment=augment,
     )
     return DataLoader(
         ds,
@@ -551,6 +543,7 @@ def train(
     for epoch in range(epochs):
         G.train()
         D.train()
+
         for step, batch in enumerate(dl):
             corrupted = batch["corrupted_crop"].to(device)
             mask = batch["target_mask"].to(device)
@@ -651,11 +644,11 @@ def generate(
             # Pripraví vstupný crop a masku pre generovanie.
             real = load_gray(str(img_path))
             mask = load_binary_mask(str(Path(mask_dir) / f"{img_path.stem}_mask.png"))
-
-            if corrupted_dir is not None:
-                corrupted = load_gray(str(Path(corrupted_dir) / img_path.name))
-            else:
-                corrupted = real.clone()
+            corrupted = (
+                load_gray(str(Path(corrupted_dir) / img_path.name))
+                if corrupted_dir is not None
+                else real.clone()
+            )
 
             real, corrupted, mask = ensure_min_size(real, corrupted, mask, min_size=crop_size)
             real, corrupted, mask = lesion_crop(real, corrupted, mask=mask, crop_size=crop_size)
@@ -664,14 +657,12 @@ def generate(
             mask_batch = mask.unsqueeze(0).to(device)
 
             # Mimo masky ostáva vstup, vnútro masky doplní model.
-            fake_batch, pred_hole_batch = G.compose(corrupted_batch, mask_batch)
-
+            fake_batch, _ = G.compose(corrupted_batch, mask_batch)
             fake = to_image_range(fake_batch[0].cpu())
-            real_vis = real.cpu()
 
             # Uloží real crop, masku a vygenerovaný výsledok.
             base = img_path.stem
-            save_image(real_vis, out_dir / f"{base}_real_crop.png")
+            save_image(real.cpu(), out_dir / f"{base}_real_crop.png")
             save_mask(mask, out_dir / f"{base}_target_mask.png")
             save_image(fake, out_dir / f"{base}_fake.png")
 
