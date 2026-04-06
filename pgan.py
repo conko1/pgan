@@ -1,4 +1,4 @@
-import os
+import math
 import random
 from pathlib import Path
 
@@ -7,428 +7,648 @@ from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils import spectral_norm
 from torch.utils.data import Dataset, DataLoader
 import torchvision.transforms.functional as TF
+from torchvision.transforms import InterpolationMode
 
 
-# ----------------------------
-# utils
-# ----------------------------
+# ============================================================
+# image helpers
+# ============================================================
 
-def load_grayscale(path):
-    return Image.open(path).convert("L")
-
-
-def pil_to_tensor(img):
-    return TF.to_tensor(img)
+def load_gray(path: str) -> torch.Tensor:
+    return TF.to_tensor(Image.open(path).convert("L"))
 
 
-def tensor_to_mask(x, thr=0.5):
-    return (x > thr).float()
+def load_binary_mask(path: str, thr: float = 1.0 / 255.0) -> torch.Tensor:
+    m = TF.to_tensor(Image.open(path).convert("L"))
+    return (m >= thr).float()
 
 
-def save_tensor_image(tensor, path):
-    tensor = tensor.detach().cpu().clamp(0, 1)
-    img = TF.to_pil_image(tensor)
-    img.save(path)
+def to_model_range(x: torch.Tensor) -> torch.Tensor:
+    return x * 2.0 - 1.0
 
 
-def random_rotate(img_t, mask_t):
-    angle = random.uniform(-15, 15)
-    img_t = TF.rotate(
-        img_t,
-        angle,
-        interpolation=TF.InterpolationMode.BILINEAR
-    )
-
-    mask_t = TF.rotate(
-        mask_t,
-        angle,
-        interpolation=TF.InterpolationMode.NEAREST
-    )
-    return img_t, mask_t
+def to_image_range(x: torch.Tensor) -> torch.Tensor:
+    return ((x + 1.0) * 0.5).clamp(0.0, 1.0)
 
 
-def find_mask_bbox(mask):
+def save_image(x: torch.Tensor, path):
+    x = x.detach().cpu()
+    if x.min() < 0:
+        x = to_image_range(x)
+    TF.to_pil_image(x.clamp(0, 1)).save(path)
+
+
+def save_mask(mask: torch.Tensor, path):
+    TF.to_pil_image((mask.detach().cpu() > 0.5).float()).save(path)
+
+
+def ensure_min_size(*tensors: torch.Tensor, min_size: int):
+    h, w = tensors[0].shape[-2:]
+    if h >= min_size and w >= min_size:
+        return tensors
+
+    scale = max(min_size / h, min_size / w)
+    nh = int(math.ceil(h * scale))
+    nw = int(math.ceil(w * scale))
+
+    out = []
+    for t in tensors:
+        is_mask = bool(torch.all((t == 0) | (t == 1)))
+        interp = InterpolationMode.NEAREST if is_mask else InterpolationMode.BILINEAR
+        resized = TF.resize(t, [nh, nw], interpolation=interp, antialias=not is_mask)
+        if is_mask:
+            resized = (resized > 0.5).float()
+        out.append(resized)
+    return tuple(out)
+
+
+def pad_chw(x: torch.Tensor, pad: int, mode: str = "reflect", value: float = 0.0) -> torch.Tensor:
+    if mode == "constant":
+        return F.pad(x, (pad, pad, pad, pad), mode=mode, value=value)
+    return F.pad(x.unsqueeze(0), (pad, pad, pad, pad), mode=mode).squeeze(0)
+
+
+def center_crop_chw(x: torch.Tensor, h: int, w: int) -> torch.Tensor:
+    _, H, W = x.shape
+    top = max(0, (H - h) // 2)
+    left = max(0, (W - w) // 2)
+    return x[:, top:top + h, left:left + w]
+
+
+def mask_bbox(mask: torch.Tensor):
     ys, xs = torch.where(mask[0] > 0.5)
     if len(xs) == 0:
         return None
-    y1, y2 = ys.min().item(), ys.max().item()
-    x1, x2 = xs.min().item(), xs.max().item()
-    return x1, y1, x2, y2
+    return xs.min().item(), ys.min().item(), xs.max().item(), ys.max().item()
 
 
-def crop_with_pad(img, x, y, size):
-    c, h, w = img.shape
-    x2 = x + size
-    y2 = y + size
+def lesion_crop(*tensors: torch.Tensor, mask: torch.Tensor, crop_size: int, jitter: int = 8):
+    tensors = ensure_min_size(*tensors, mask, min_size=crop_size)
+    *imgs, mask = tensors
+    _, h, w = mask.shape
 
-    pad_l = max(0, -x)
-    pad_t = max(0, -y)
-    pad_r = max(0, x2 - w)
-    pad_b = max(0, y2 - h)
+    ys, xs = torch.where(mask[0] > 0.5)
 
-    if pad_l or pad_t or pad_r or pad_b:
-        img = F.pad(img, (pad_l, pad_r, pad_t, pad_b), mode="constant", value=0)
-        x += pad_l
-        y += pad_t
-
-    return img[:, y:y+size, x:x+size]
-
-
-def get_breast_mask(img, thr=0.05):
-    return (img > thr).float()
-
-
-def crop_is_inside_breast(breast_crop, min_breast_fraction=0.95):
-    return breast_crop.mean().item() >= min_breast_fraction
-
-
-def random_healthy_crop(img, mask, crop_size, tries=100, min_breast_fraction=0.95):
-    _, h, w = img.shape
-
-    breast_mask = get_breast_mask(img)
-
-    for _ in range(tries):
-        x = random.randint(0, w - crop_size)
-        y = random.randint(0, h - crop_size)
-
-        crop_img = img[:, y:y+crop_size, x:x+crop_size]
-        crop_mask = mask[:, y:y+crop_size, x:x+crop_size]
-        crop_breast = breast_mask[:, y:y+crop_size, x:x+crop_size]
-
-        no_lesion = crop_mask.sum() == 0
-        enough_breast = crop_is_inside_breast(
-            crop_breast,
-            min_breast_fraction=min_breast_fraction
-        )
-
-        if no_lesion and enough_breast:
-            return crop_img, crop_mask
-
-    best = None
-    best_score = float("inf")
-
-    for _ in range(tries):
-        x = random.randint(0, w - crop_size)
-        y = random.randint(0, h - crop_size)
-
-        crop_img = img[:, y:y+crop_size, x:x+crop_size]
-        crop_mask = mask[:, y:y+crop_size, x:x+crop_size]
-        crop_breast = breast_mask[:, y:y+crop_size, x:x+crop_size]
-
-        lesion_score = crop_mask.sum().item()
-        breast_penalty = 1.0 - crop_breast.mean().item()
-
-        score = lesion_score + 1000.0 * breast_penalty
-
-        if score < best_score:
-            best_score = score
-            best = (crop_img, crop_mask)
-
-    return best
-
-
-def lesion_center_crop(img, mask, crop_size):
-    bbox = find_mask_bbox(mask)
-    _, h, w = img.shape
-
-    if bbox is None:
+    if len(xs) == 0:
         x = max(0, (w - crop_size) // 2)
         y = max(0, (h - crop_size) // 2)
-        return img[:, y:y+crop_size, x:x+crop_size], mask[:, y:y+crop_size, x:x+crop_size]
+    else:
+        i = random.randint(0, len(xs) - 1)
+        cx = xs[i].item()
+        cy = ys[i].item()
 
-    x1, y1, x2, y2 = bbox
-    cx = (x1 + x2) // 2
-    cy = (y1 + y2) // 2
-    x = cx - crop_size // 2
-    y = cy - crop_size // 2
-    return crop_with_pad(img, x, y, crop_size), crop_with_pad(mask, x, y, crop_size)
+        x = cx - crop_size // 2 + random.randint(-jitter, jitter)
+        y = cy - crop_size // 2 + random.randint(-jitter, jitter)
+
+        x = max(0, min(x, w - crop_size))
+        y = max(0, min(y, h - crop_size))
+
+    cropped = [img[:, y:y + crop_size, x:x + crop_size] for img in imgs]
+    mask_crop = mask[:, y:y + crop_size, x:x + crop_size]
+    return (*cropped, mask_crop)
+
+# ============================================================
+# augmentation
+# ============================================================
+
+def _shared_rotate_translate(*imgs: torch.Tensor, mask: torch.Tensor, angle_range: float = 12.0, max_shift: int = 8):
+    angle = random.uniform(-angle_range, angle_range)
+    pad = max(32, max_shift)
+    h, w = imgs[0].shape[-2:]
+
+    out_imgs = []
+    for img in imgs:
+        p = pad_chw(img, pad, mode="reflect")
+        r = TF.rotate(p, angle, interpolation=InterpolationMode.BILINEAR)
+        out_imgs.append(center_crop_chw(r, h + 2 * max_shift, w + 2 * max_shift))
+
+    mask_p = pad_chw(mask, pad, mode="constant", value=0.0)
+    mask_r = TF.rotate(mask_p, angle, interpolation=InterpolationMode.NEAREST, fill=0.0)
+    mask_r = center_crop_chw(mask_r, h + 2 * max_shift, w + 2 * max_shift)
+
+    tx = random.randint(-max_shift, max_shift)
+    ty = random.randint(-max_shift, max_shift)
+    left = max_shift - tx
+    top = max_shift - ty
+
+    out_imgs = [img[:, top:top + h, left:left + w] for img in out_imgs]
+    mask_r = mask_r[:, top:top + h, left:left + w]
+    return (*out_imgs, (mask_r > 0).float())
 
 
-# ----------------------------
+def _shared_intensity_noise(*imgs: torch.Tensor, p: float = 0.2, noise_p: float = 0.05, sigma: float = 0.003):
+    if random.random() < p:
+        gamma = random.uniform(0.97, 1.03)
+        gain = random.uniform(0.98, 1.03)
+        imgs = tuple(TF.adjust_gamma(img, gamma=gamma, gain=gain) for img in imgs)
+    if random.random() < p:
+        contrast = random.uniform(0.95, 1.08)
+        imgs = tuple(TF.adjust_contrast(img, contrast) for img in imgs)
+    if random.random() < noise_p:
+        noise = torch.randn_like(imgs[0]) * sigma
+        imgs = tuple((img + noise).clamp(0, 1) for img in imgs)
+    return imgs
+
+
+def augment_sample(real: torch.Tensor, mask: torch.Tensor, corrupted: torch.Tensor | None = None):
+    items = [real] if corrupted is None else [real, corrupted]
+
+    if random.random() < 0.5:
+        items = [TF.hflip(x) for x in items]
+        mask = TF.hflip(mask)
+
+    if corrupted is None:
+        real, mask = _shared_rotate_translate(items[0], mask=mask)
+        real, = _shared_intensity_noise(real)
+        return real, mask
+
+    real, corrupted, mask = _shared_rotate_translate(items[0], items[1], mask=mask)
+    real, corrupted = _shared_intensity_noise(real, corrupted)
+    return real, corrupted, mask
+
+
+# ============================================================
 # dataset
-# ----------------------------
+# ============================================================
 
-class MammogramGanDataset(Dataset):
-    def __init__(self, image_dir, mask_dir, crop_size=256, augment=True):
-        self.image_dir = Path(image_dir)
+class MammogramInpaintDataset(Dataset):
+    def __init__(
+        self,
+        healthy_dir,
+        mask_dir,
+        corrupted_dir=None,
+        crop_size=256,
+        augment=True,
+    ):
+        self.healthy_dir = Path(healthy_dir)
         self.mask_dir = Path(mask_dir)
+        self.corrupted_dir = Path(corrupted_dir) if corrupted_dir is not None else None
         self.crop_size = crop_size
         self.augment = augment
 
-        self.image_paths = sorted(list(self.image_dir.glob("*.jpg")))
-        if not self.image_paths:
-            raise ValueError("No .jpg files found in image_dir")
+        self.healthy_paths = sorted(self.healthy_dir.glob("*.jpg"))
+        if not self.healthy_paths:
+            raise ValueError("No .jpg files found in healthy_dir")
+
+        missing_masks = []
+        missing_corrupted = []
+        for p in self.healthy_paths:
+            mp = self.mask_dir / f"{p.stem}_mask.png"
+            if not mp.exists():
+                missing_masks.append(mp.name)
+            if self.corrupted_dir is not None:
+                cp = self.corrupted_dir / p.name
+                if not cp.exists():
+                    missing_corrupted.append(cp.name)
+
+        if missing_masks:
+            raise ValueError(f"Missing masks, first few: {missing_masks[:5]}")
+        if missing_corrupted:
+            raise ValueError(f"Missing corrupted images, first few: {missing_corrupted[:5]}")
 
     def __len__(self):
-        return len(self.image_paths)
+        return len(self.healthy_paths)
 
     def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        mask_path = self.mask_dir / (img_path.stem + "_mask.png")
+        img_path = self.healthy_paths[idx]
+        mask_path = self.mask_dir / f"{img_path.stem}_mask.png"
 
-        img = pil_to_tensor(load_grayscale(str(img_path)))
-        mask = pil_to_tensor(load_grayscale(str(mask_path)))
-        mask = tensor_to_mask(mask)
+        real = load_gray(str(img_path))
+        mask = load_binary_mask(str(mask_path))
+        corrupted = load_gray(str(self.corrupted_dir / img_path.name)) if self.corrupted_dir is not None else None
 
-        if self.augment:
-            img, mask = random_rotate(img, mask)
 
-        real_crop, real_mask = lesion_center_crop(img, mask, self.crop_size)
-        healthy_crop, _ = random_healthy_crop(img, mask, self.crop_size)
+        if corrupted is None:
+            real, mask = ensure_min_size(real, mask, min_size=self.crop_size)
+            if self.augment:
+                real, mask = augment_sample(real, mask)
+            real, mask = lesion_crop(real, mask=mask, crop_size=self.crop_size)
+        else:
+            real, corrupted, mask = ensure_min_size(real, corrupted, mask, min_size=self.crop_size)
+            if self.augment:
+                real, corrupted, mask = augment_sample(real, mask, corrupted)
+            real, corrupted, mask = lesion_crop(real, corrupted, mask=mask, crop_size=self.crop_size)
 
-        target_mask = real_mask.clone()
+        target_mask = mask.clone()
+
+        if corrupted is None or target_mask.sum().item() == 0:
+            corrupted = real * (1.0 - target_mask)
 
         return {
-            "healthy_crop": healthy_crop,
+            "corrupted_crop": to_model_range(corrupted),
             "target_mask": target_mask,
-            "real_crop": real_crop,
-            "real_mask": real_mask,
+            "real_crop": to_model_range(real),
             "image_name": img_path.stem,
         }
 
 
-# ----------------------------
-# generator
-# ----------------------------
+# ============================================================
+# model blocks
+# ============================================================
+
+class ConvNormAct(nn.Module):
+    def __init__(self, in_ch, out_ch, k=3, s=1, p=1, act="relu"):
+        super().__init__()
+        layers = [
+            nn.ReflectionPad2d(p),
+            nn.Conv2d(in_ch, out_ch, kernel_size=k, stride=s, padding=0, bias=False),
+            nn.InstanceNorm2d(out_ch, affine=True),
+        ]
+        if act == "relu":
+            layers.append(nn.ReLU(inplace=True))
+        elif act == "lrelu":
+            layers.append(nn.LeakyReLU(0.2, inplace=True))
+        elif act != "none":
+            raise ValueError(act)
+        self.block = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.block(x)
+
+
+class ResBlock(nn.Module):
+    def __init__(self, ch, dropout=0.1):
+        super().__init__()
+        self.c1 = ConvNormAct(ch, ch, act="relu")
+        self.do = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.c2 = ConvNormAct(ch, ch, act="none")
+
+    def forward(self, x):
+        return x + self.c2(self.do(self.c1(x)))
+
 
 class Down(nn.Module):
-    def __init__(self, in_ch, out_ch, norm=True):
+    def __init__(self, in_ch, out_ch):
         super().__init__()
-        layers = [nn.Conv2d(in_ch, out_ch, 4, 2, 1, bias=False)]
-        if norm:
-            layers.append(nn.BatchNorm2d(out_ch))
-        layers.append(nn.LeakyReLU(0.2, inplace=True))
-        self.block = nn.Sequential(*layers)
+        self.block = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(out_ch, affine=True),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
 
     def forward(self, x):
         return self.block(x)
 
 
 class Up(nn.Module):
-    def __init__(self, in_ch, out_ch, dropout=False):
+    def __init__(self, in_ch, out_ch, dropout=0.0):
         super().__init__()
-        layers = [
-            nn.ConvTranspose2d(in_ch, out_ch, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(out_ch),
+        self.block = nn.Sequential(
+            nn.ConvTranspose2d(in_ch, out_ch, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(out_ch, affine=True),
             nn.ReLU(inplace=True),
-        ]
-        if dropout:
-            layers.append(nn.Dropout(0.5))
-        self.block = nn.Sequential(*layers)
+            nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
+        )
 
     def forward(self, x):
         return self.block(x)
 
 
-class UNetGenerator(nn.Module):
-    def __init__(self, in_ch=2, out_ch=1):
+def crop_to(ref_src, ref_dst):
+    _, _, h, w = ref_src.shape
+    _, _, rh, rw = ref_dst.shape
+    if h == rh and w == rw:
+        return ref_src
+    top = max((h - rh) // 2, 0)
+    left = max((w - rw) // 2, 0)
+    return ref_src[:, :, top:top + rh, left:left + rw]
+
+
+# ============================================================
+# generator
+# ============================================================
+
+class ResidualUNetGenerator(nn.Module):
+    def __init__(self, in_ch=2, out_ch=1, base=64, n_res=4):
         super().__init__()
-        self.d1 = Down(in_ch, 64, norm=False)
-        self.d2 = Down(64, 128)
-        self.d3 = Down(128, 256)
-        self.d4 = Down(256, 512)
+        self.d1 = nn.Sequential(
+            nn.Conv2d(in_ch, base, kernel_size=4, stride=2, padding=1),
+            nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.d2 = Down(base, base * 2)
+        self.d3 = Down(base * 2, base * 4)
+        self.d4 = Down(base * 4, base * 8)
+        self.mid = nn.Sequential(*[ResBlock(base * 8, dropout=0.1) for _ in range(n_res)])
+        self.u1 = Up(base * 8, base * 4, dropout=0.1)
+        self.u2 = Up(base * 8, base * 2)
+        self.u3 = Up(base * 4, base)
+        self.out = nn.Sequential(
+            nn.ConvTranspose2d(base * 2, out_ch, kernel_size=4, stride=2, padding=1),
+            nn.Tanh(),
+        )
 
-        self.u1 = Up(512, 256)
-        self.u2 = Up(512, 128)
-        self.u3 = Up(256, 64)
-        self.u4 = nn.ConvTranspose2d(128, out_ch, 4, 2, 1)
-
-    def forward(self, healthy, target_mask):
-        x = torch.cat([healthy, target_mask], dim=1)
-
+    def forward(self, corrupted, mask):
+        x = torch.cat([corrupted, mask], dim=1)
         d1 = self.d1(x)
         d2 = self.d2(d1)
         d3 = self.d3(d2)
         d4 = self.d4(d3)
+        b = self.mid(d4)
 
-        u1 = self.u1(d4)
+        u1 = crop_to(self.u1(b), d3)
         u1 = torch.cat([u1, d3], dim=1)
-
-        u2 = self.u2(u1)
+        u2 = crop_to(self.u2(u1), d2)
         u2 = torch.cat([u2, d2], dim=1)
-
-        u3 = self.u3(u2)
+        u3 = crop_to(self.u3(u2), d1)
         u3 = torch.cat([u3, d1], dim=1)
+        return self.out(u3)
 
-        out = self.u4(u3)
-        out = torch.sigmoid(out)
-        return out
+    def compose(self, corrupted, mask):
+        pred_hole = self.forward(corrupted, mask)
+        fake = (corrupted * (1.0 - mask) + pred_hole * mask).clamp(-1.0, 1.0)
+        return fake, pred_hole
 
 
-# ----------------------------
+# ============================================================
 # discriminator
-# ----------------------------
+# ============================================================
 
-class PatchDiscriminator(nn.Module):
-    def __init__(self, in_ch=2):
+class SNBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, stride=2):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_ch, 64, 4, 2, 1),
+        self.block = nn.Sequential(
+            spectral_norm(nn.Conv2d(in_ch, out_ch, kernel_size=4, stride=stride, padding=1)),
             nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(64, 128, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(128, 256, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(256, 512, 4, 1, 1, bias=False),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.2, inplace=True),
-
-            nn.Conv2d(512, 1, 4, 1, 1)
         )
 
-    def forward(self, img, mask):
-        x = torch.cat([img, mask], dim=1)
-        return self.net(x)
+    def forward(self, x):
+        return self.block(x)
 
 
-# ----------------------------
-# training
-# ----------------------------
+class PatchDiscriminator(nn.Module):
+    def __init__(self, in_ch=3, base=64):
+        super().__init__()
+        self.b1 = SNBlock(in_ch, base, stride=2)
+        self.b2 = SNBlock(base, base * 2, stride=2)
+        self.b3 = SNBlock(base * 2, base * 4, stride=2)
+        self.b4 = SNBlock(base * 4, base * 8, stride=1)
+        self.out = spectral_norm(nn.Conv2d(base * 8, 1, kernel_size=4, stride=1, padding=1))
 
-def train_minimal(
-    image_dir,
+    def forward(self, corrupted, img, mask, return_features=False):
+        x = torch.cat([corrupted, img, mask], dim=1)
+        f1 = self.b1(x)
+        f2 = self.b2(f1)
+        f3 = self.b3(f2)
+        f4 = self.b4(f3)
+        logits = self.out(f4)
+        if return_features:
+            return logits, [f1, f2, f3, f4]
+        return logits
+
+
+class MultiScaleDiscriminator(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.d1 = PatchDiscriminator()
+        self.d2 = PatchDiscriminator()
+        self.pool = nn.AvgPool2d(kernel_size=3, stride=2, padding=1, count_include_pad=False)
+
+    def forward(self, corrupted, img, mask, return_features=False):
+        if return_features:
+            out1, feat1 = self.d1(corrupted, img, mask, return_features=True)
+            corrupted2, img2, mask2 = self.pool(corrupted), self.pool(img), self.pool(mask)
+            out2, feat2 = self.d2(corrupted2, img2, mask2, return_features=True)
+            return [out1, out2], [feat1, feat2]
+
+        out1 = self.d1(corrupted, img, mask)
+        corrupted2, img2, mask2 = self.pool(corrupted), self.pool(img), self.pool(mask)
+        out2 = self.d2(corrupted2, img2, mask2)
+        return [out1, out2]
+
+
+# ============================================================
+# losses
+# ============================================================
+
+def masked_l1(pred, target, mask, min_pixels=32.0):
+    pixels = mask.sum(dim=(1, 2, 3)).clamp_min(min_pixels)
+    return ((pred - target).abs() * mask).sum(dim=(1, 2, 3)).div(pixels).mean()
+
+
+def boundary_ring(mask, k=7):
+    pad = k // 2
+    dil = F.max_pool2d(mask, kernel_size=k, stride=1, padding=pad)
+    ero = -F.max_pool2d(-mask, kernel_size=k, stride=1, padding=pad)
+    return (dil - ero).clamp(0, 1)
+
+
+def d_hinge(real_logits, fake_logits):
+    return F.relu(1.0 - real_logits).mean() + F.relu(1.0 + fake_logits).mean()
+
+def g_hinge(fake_logits):
+    return -fake_logits.mean()
+
+
+def feature_matching(fake_feats, real_feats):
+    total, n = 0.0, 0
+    for ff_scale, rf_scale in zip(fake_feats, real_feats):
+        for ff, rf in zip(ff_scale, rf_scale):
+            total = total + F.l1_loss(ff, rf.detach())
+            n += 1
+    return total / max(1, n)
+
+
+def r1_penalty(discriminator_single_scale, corrupted, real, mask):
+    real = real.requires_grad_(True)
+    pred = discriminator_single_scale(corrupted, real, mask)
+    grad = torch.autograd.grad(pred.sum(), real, create_graph=True, retain_graph=True, only_inputs=True)[0]
+    return grad.pow(2).reshape(grad.size(0), -1).sum(1).mean()
+
+
+# ============================================================
+# train / infer
+# ============================================================
+
+def build_loader(healthy_dir, mask_dir, corrupted_dir=None, crop_size=256, batch_size=8, num_workers=0, augment=True):
+    ds = MammogramInpaintDataset(
+        healthy_dir=healthy_dir,
+        mask_dir=mask_dir,
+        corrupted_dir=corrupted_dir,
+        crop_size=crop_size,
+        augment=augment
+    )
+    return DataLoader(
+        ds,
+        batch_size=batch_size,
+        shuffle=augment,
+        num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=augment,
+    )
+
+
+def train(
+    healthy_dir,
     mask_dir,
-    epochs=5,
-    batch_size=4,
+    corrupted_dir=None,
+    epochs=20,
+    batch_size=8,
     crop_size=256,
-    device="cuda" if torch.cuda.is_available() else "cpu",
     save_path="generator.pt",
+    device=None,
+    num_workers=0,
+    lr_g=1e-4,
+    lr_d=1e-4,
+    lambda_hole=20.0,
+    lambda_bg=5.0,
+    lambda_boundary=15.0,
+    lambda_fm=5.0,
+    r1_gamma=5.0,
+    r1_every=8,
 ):
-    ds = MammogramGanDataset(image_dir, mask_dir, crop_size=crop_size, augment=True)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0)
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    dl = build_loader(healthy_dir, mask_dir, corrupted_dir, crop_size, batch_size, num_workers, augment=True)
 
-    G = UNetGenerator().to(device)
-    D = PatchDiscriminator().to(device)
+    G = ResidualUNetGenerator().to(device)
+    D = MultiScaleDiscriminator().to(device)
 
-    opt_g = torch.optim.Adam(G.parameters(), lr=2e-4, betas=(0.5, 0.999))
-    opt_d = torch.optim.Adam(D.parameters(), lr=2e-4, betas=(0.5, 0.999))
+    opt_g = torch.optim.Adam(G.parameters(), lr=lr_g, betas=(0.0, 0.9))
+    opt_d = torch.optim.Adam(D.parameters(), lr=lr_d, betas=(0.0, 0.9))
 
-    bce = nn.BCEWithLogitsLoss()
-    l1 = nn.L1Loss()
+    amp_enabled = device.startswith("cuda")
+    scaler_g = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+    scaler_d = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+
+    step_global = 0
 
     for epoch in range(epochs):
+        G.train()
+        D.train()
         for step, batch in enumerate(dl):
-            healthy = batch["healthy_crop"].to(device)
-            target_mask = batch["target_mask"].to(device)
+            corrupted = batch["corrupted_crop"].to(device)
+            mask = batch["target_mask"].to(device)
             real = batch["real_crop"].to(device)
-            real_mask = batch["real_mask"].to(device)
 
-            fake = G(healthy, target_mask).detach()
+            # ---- D ----
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
+                fake, _ = G.compose(corrupted, mask)
+                pred_real = D(corrupted, real, mask)
+                pred_fake = D(corrupted, fake.detach(), mask)
+                loss_d = sum(d_hinge(pr, pf) for pr, pf in zip(pred_real, pred_fake)) / len(pred_real)
 
-            pred_real = D(real, real_mask)
-            pred_fake = D(fake, target_mask)
+            opt_d.zero_grad(set_to_none=True)
+            scaler_d.scale(loss_d).backward()
+            scaler_d.step(opt_d)
+            scaler_d.update()
 
-            loss_d_real = bce(pred_real, torch.ones_like(pred_real))
-            loss_d_fake = bce(pred_fake, torch.zeros_like(pred_fake))
-            loss_d = 0.5 * (loss_d_real + loss_d_fake)
+            loss_r1 = torch.tensor(0.0, device=device)
+            if step_global % r1_every == 0:
+                opt_d.zero_grad(set_to_none=True)
+                with torch.amp.autocast("cuda", enabled=False):
+                    loss_r1 = 0.5 * r1_gamma * r1_penalty(D.d1, corrupted.float(), real.float(), mask.float())
+                loss_r1.backward()
+                opt_d.step()
 
-            opt_d.zero_grad()
-            loss_d.backward()
-            opt_d.step()
+            # ---- G ----
+            with torch.amp.autocast("cuda", enabled=amp_enabled):
+                fake, _ = G.compose(corrupted, mask)
+                pred_fake, fake_feats = D(corrupted, fake, mask, return_features=True)
+                _, real_feats = D(corrupted, real, mask, return_features=True)
 
-            fake = G(healthy, target_mask)
-            pred_fake = D(fake, target_mask)
+                loss_adv = sum(g_hinge(pf) for pf in pred_fake) / len(pred_fake)
+                bg = 1.0 - mask
+                boundary = boundary_ring(mask, k=5)
+                loss_hole = masked_l1(fake, real, mask, min_pixels=32.0)
+                loss_bg = masked_l1(fake, real, bg, min_pixels=256.0)
+                loss_boundary = masked_l1(fake, real, boundary, min_pixels=32.0)
+                loss_fm = feature_matching(fake_feats, real_feats)
 
-            loss_g_adv = bce(pred_fake, torch.ones_like(pred_fake))
+                loss_g = (
+                    loss_adv
+                    + lambda_hole * loss_hole
+                    + lambda_bg * loss_bg
+                    + lambda_boundary * loss_boundary
+                    + lambda_fm * loss_fm
+                )
 
-            bg = 1.0 - target_mask
-            loss_bg = l1(fake * bg, healthy * bg)
-
-            loss_lesion = l1(fake * target_mask, real * target_mask)
-
-            loss_g = loss_g_adv + 50.0 * loss_bg + 20.0 * loss_lesion
-
-            opt_g.zero_grad()
-            loss_g.backward()
-            opt_g.step()
+            opt_g.zero_grad(set_to_none=True)
+            scaler_g.scale(loss_g).backward()
+            scaler_g.step(opt_g)
+            scaler_g.update()
 
             if step % 20 == 0:
                 print(
                     f"epoch {epoch + 1}/{epochs} step {step:04d} | "
-                    f"loss_d={loss_d.item():.4f} "
-                    f"loss_g={loss_g.item():.4f} "
-                    f"adv={loss_g_adv.item():.4f} "
-                    f"bg={loss_bg.item():.4f} "
-                    f"lesion={loss_lesion.item():.4f}"
+                    f"D={loss_d.item():.4f} R1={loss_r1.item():.4f} G={loss_g.item():.4f} "
+                    f"adv={loss_adv.item():.4f} hole={loss_hole.item():.4f} "
+                    f"bg={loss_bg.item():.4f} boundary={loss_boundary.item():.4f} fm={loss_fm.item():.4f}"
                 )
 
-    torch.save(G.state_dict(), save_path)
-    print(f"saved generator to {save_path}")
+            step_global += 1
 
+    torch.save(G.state_dict(), save_path)
+    print(f"Saved generator to {save_path}")
     return G, D
 
 
-# ----------------------------
-# generation
-# ----------------------------
-
-def generate_from_directory(
-    image_dir,
+def generate(
+    healthy_dir,
     mask_dir,
+    corrupted_dir=None,
     model_path="generator.pt",
     output_dir="generated",
     crop_size=256,
-    device="cuda" if torch.cuda.is_available() else "cpu",
+    device=None,
 ):
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    G = UNetGenerator().to(device)
+    G = ResidualUNetGenerator().to(device)
     G.load_state_dict(torch.load(model_path, map_location=device))
     G.eval()
 
-    image_paths = sorted(list(Path(image_dir).glob("*.jpg")))
-    if not image_paths:
-        raise ValueError("No .jpg files found in image_dir")
+    healthy_paths = sorted(Path(healthy_dir).glob("*.jpg"))
+    if not healthy_paths:
+        raise ValueError("No .png files found in healthy_dir")
 
     with torch.no_grad():
-        for img_path in image_paths:
-            mask_path = Path(mask_dir) / (img_path.stem + "_mask.png")
+        for img_path in healthy_paths:
+            real = load_gray(str(img_path))
+            mask = load_binary_mask(str(Path(mask_dir) / f"{img_path.stem}_mask.png"))
 
-            img = pil_to_tensor(load_grayscale(str(img_path)))
-            mask = pil_to_tensor(load_grayscale(str(mask_path)))
-            mask = tensor_to_mask(mask)
+            if corrupted_dir is not None:
+                corrupted = load_gray(str(Path(corrupted_dir) / img_path.name))
+            else:
+                corrupted = real.clone()
 
-            healthy_crop, _ = random_healthy_crop(img, mask, crop_size)
-            _, real_mask = lesion_center_crop(img, mask, crop_size)
+            real, corrupted, mask = ensure_min_size(real, corrupted, mask, min_size=crop_size)
+            real, corrupted, mask = lesion_crop(real, corrupted, mask=mask, crop_size=crop_size)
 
-            healthy_batch = healthy_crop.unsqueeze(0).to(device)
-            target_mask_batch = real_mask.unsqueeze(0).to(device)
+            corrupted_batch = to_model_range(corrupted).unsqueeze(0).to(device)
+            mask_batch = mask.unsqueeze(0).to(device)
 
-            fake = G(healthy_batch, target_mask_batch)[0].cpu()
+            # outside from input image, inside from prediction
+            fake_batch, pred_hole_batch = G.compose(corrupted_batch, mask_batch)
 
-            overlay = healthy_crop * (1.0 - real_mask) + fake * real_mask
+            fake = to_image_range(fake_batch[0].cpu())
+            real_vis = real.cpu()
 
             base = img_path.stem
-            save_tensor_image(healthy_crop, output_dir / f"{base}_healthy.jpg")
-            save_tensor_image(real_mask, output_dir / f"{base}_target_mask.jpg")
-            save_tensor_image(fake, output_dir / f"{base}_fake.jpg")
-            save_tensor_image(overlay, output_dir / f"{base}_overlay.jpg")
-
-            print(f"generated for {img_path.name}")
+            save_image(real_vis, out_dir / f"{base}_real_crop.png")
+            save_mask(mask, out_dir / f"{base}_target_mask.png")
+            save_image(fake, out_dir / f"{base}_fake.png")
 
 
 if __name__ == "__main__":
-    G, D = train_minimal(
-        image_dir="images_vindr",
-        mask_dir="masks_vindr",
-        epochs=15,
-        batch_size=8,
-        crop_size=256,
-        save_path="generator.pt",
-    )
+    # Example:
+    # train(
+    #     healthy_dir="images_vindr",
+    #     mask_dir="masks_vindr",
+    #     corrupted_dir="images_vindr_inpainted_bigger_3",
+    #     epochs=15,
+    #     batch_size=8,
+    #     crop_size=256,
+    #     save_path="generator_classic-inpainted_bigger_3_out16.pt",
+    # )
 
-    generate_from_directory(
-        image_dir="images_vindr",
-        mask_dir="masks_vindr",
-        model_path="generator.pt",
-        output_dir="generated_7",
-        crop_size=512,
+    generate(
+        healthy_dir="images_vindr_removed",
+        mask_dir="images_vindr_removed_masks",
+        model_path="latest.pt",
+        output_dir="synthetic_dataset_vindr_removed",
+        crop_size=1024,
     )
