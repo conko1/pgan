@@ -1,0 +1,35 @@
+# configs/config_train.yaml
+# Tréningová konfigurácia. Layeruje base_config a prepíše len to, čo potrebuje.
+
+base_config: "config.yaml"
+
+project:
+  name: "pgan_run_v2"
+
+runtime:
+  device: "auto"
+  num_workers: 4
+
+data:
+  crop_size: 256
+  batch_size: 8
+  eval_batch_size: 8
+  train:
+    healthy_dir: "dataset/train/images"
+    mask_dir: "dataset/train/masks"
+    corrupted_dir: "dataset/train/corrupted"
+  val:
+    healthy_dir: "dataset/val/images"
+    mask_dir: "dataset/val/masks"
+    corrupted_dir: "dataset/val/corrupted"
+  test:
+    healthy_dir: "dataset/test/images"
+    mask_dir: "dataset/test/masks"
+    corrupted_dir: "dataset/test/corrupted"
+
+train:
+  epochs: 20
+  best_metric_name: "lpips"
+
+output:
+  save_dir: "runs/pgan_v2"

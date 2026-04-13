@@ -1,0 +1,17 @@
+# configs/config_generate.yaml
+# Generovacia konfigurácia. Layeruje base_config a zameriava sa na inference.
+
+base_config: "config.yaml"
+
+runtime:
+  device: "auto"
+
+data:
+  crop_size: 256
+
+generate:
+  healthy_dir: "healthy_patches"
+  mask_dir: "healthy_patches_masks"
+  corrupted_dir: null
+  model_path: "runs/pgan_v2/checkpoints/best_by_lpips.pt"
+  output_dir: "runs/pgan_v2/visuals/synthetic_dataset"

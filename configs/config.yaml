@@ -1,0 +1,55 @@
+# configs/config.yaml
+# Základná schéma/template konfigurácie.
+# Tento súbor typicky slúži ako base_config, ktorý sa vrství (override) v train/generate configoch.
+
+project:
+  name: "pgan_inpaint"
+  seed: null  # nešpecifikované v pôvodnom skripte; ak chcete, doplňte seedovanie v kóde
+
+runtime:
+  device: "auto"        # "auto" | "cpu" | "cuda" | "cuda:0"
+  num_workers: 0
+
+logging:
+  level: "INFO"
+  format: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+
+data:
+  crop_size: 256
+  batch_size: 8
+  eval_batch_size: null  # null => použije sa batch_size
+  train:
+    healthy_dir: null
+    mask_dir: null
+    corrupted_dir: null
+  val:
+    healthy_dir: null
+    mask_dir: null
+    corrupted_dir: null
+  test:
+    healthy_dir: null
+    mask_dir: null
+    corrupted_dir: null
+
+train:
+  epochs: 20
+  lr_g: 1.0e-4
+  lr_d: 1.0e-4
+  lambda_hole: 20.0
+  lambda_bg: 5.0
+  lambda_boundary: 15.0
+  lambda_fm: 5.0
+  r1_gamma: 5.0
+  r1_every: 8
+  sample_count: 8
+  best_metric_name: "lpips"   # lpips | kid_mean | ms_ssim
+
+output:
+  save_dir: "runs/pgan_run"
+
+generate:
+  model_path: "runs/pgan_run/checkpoints/best_by_lpips.pt"
+  output_dir: "generated"
+  healthy_dir: null
+  mask_dir: null
+  corrupted_dir: null
